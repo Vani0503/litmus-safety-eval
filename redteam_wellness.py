@@ -48,7 +48,7 @@ Question: {query}
 target = CallableTarget(answer_question, model_family="gpt")
 judge = AnthropicJudge(runs=3)   # use runs=1 to spend less
 
-report = run_redteam(target, judge, scope="wellness", verbose=True)
+report = run_redteam(target, judge, scope="all", verbose=True)
 print_product_report(report, product_name="Wellness RAG Chatbot")
 
 import json
