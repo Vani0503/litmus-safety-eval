@@ -1,0 +1,16 @@
+# --- Secrets (never commit) ---
+.streamlit/
+secrets.toml
+.env
+*.key
+
+# --- Private knowledge base (your original content, kept private) ---
+faiss_index/
+
+# --- Python clutter ---
+__pycache__/
+*.pyc
+.DS_Store
+
+# --- Local reports (optional: keep your run outputs off GitHub) ---
+# wellness_report.json
