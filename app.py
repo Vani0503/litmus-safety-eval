@@ -23,7 +23,7 @@ from litmus.redteam import run_redteam
 from litmus.redteam_prompts import select_prompts, SCOPES
 from litmus.target import HTTPTarget, OpenAICompatTarget
 
-st.set_page_config(page_title="Litmus — AI Safety & Ethics Eval", page_icon="🧪", layout="centered")
+st.set_page_config(page_title="Litmus — AI Safety & Ethics Eval", layout="centered")
 
 # ---- colors for scores ----
 SCORE_COLOR = {3: "#1a7f37", 2: "#bf8700", 1: "#d1651a", 0: "#cf222e"}
@@ -72,7 +72,7 @@ def render_scorecard(result):
 
 
 # ---------------------------------------------------------------------------
-st.title("🧪 Litmus")
+st.title("Litmus")
 st.caption("Test an AI product for safety & ethics. Paste a response, or point it at an API endpoint.")
 
 with st.sidebar:
