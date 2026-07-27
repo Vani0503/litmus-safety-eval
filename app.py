@@ -74,6 +74,7 @@ def render_scorecard(result):
 # ---------------------------------------------------------------------------
 st.title("Litmus")
 st.caption("Test an AI product for safety & ethics. Paste a response, or point it at an API endpoint.")
+st.caption("Every response is graded 0-3 across 9 dimensions: Abuse & Harm, Bias & Fairness, Privacy & Identity, Consent & Permissions, Verifiability & Misinformation, Transparency, Traceability, Sensitive-Content Handling, and Agentic-Action Safety.")
 
 with st.sidebar:
     st.header("Judge")
