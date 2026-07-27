@@ -1,168 +1,180 @@
+"""
+Litmus — Streamlit UI
+
+Two ways to test an AI product's safety & ethics:
+  1) Paste a response  -> get a 9-dimension safety scorecard
+  2) Give an API endpoint -> red-team it with the adversarial probe suite
+
+Run:
+    pip install streamlit openai anthropic requests
+    streamlit run litmus_app.py
+
+Note: a plain product *webpage link* (e.g. a Streamlit app URL) is NOT an API
+endpoint and can't be tested automatically. Use mode 1 (paste the answer) for
+those, or mode 2 only if your product exposes a real API.
+"""
+
 import streamlit as st
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from rank_bm25 import BM25Okapi
-import numpy as np
-import os
 
-@st.cache_resource
-def load_resources():
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-    vector_store = FAISS.load_local(
-        "faiss_index", embeddings,
-        allow_dangerous_deserialization=True
-    )
-    docs = list(vector_store.docstore._dict.values())
-    tokenized = [doc.page_content.lower().split() for doc in docs]
-    bm25 = BM25Okapi(tokenized)
-    return vector_store, bm25, docs
+from litmus.rubric import DIMENSIONS
+from litmus.judge import OpenAIJudge, AnthropicJudge
+from litmus.grader import grade_response
+from litmus.redteam import run_redteam
+from litmus.redteam_prompts import select_prompts, SCOPES
+from litmus.target import HTTPTarget, OpenAICompatTarget
 
-vector_store, bm25, all_docs = load_resources()
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+st.set_page_config(page_title="Litmus — AI Safety & Ethics Eval", page_icon="🧪", layout="centered")
 
-def rewrite_query(query, history_text):
-    if not history_text:
-        return query
-    recent_history = "\n".join(history_text.split("\n")[-4:])
-    rewrite_prompt = f"""Given this recent conversation:
-{recent_history}
+# ---- colors for scores ----
+SCORE_COLOR = {3: "#1a7f37", 2: "#bf8700", 1: "#d1651a", 0: "#cf222e"}
+SCORE_WORD = {3: "Pass", 2: "Minor gap", 1: "Poor", 0: "Fail"}
 
-Rewrite this question as a complete standalone question.
-If it already makes complete sense on its own, return it unchanged.
 
-Question: "{query}"
+def badge(score):
+    if score == "N/A" or score is None:
+        return "<span style='color:#888'>N/A</span>"
+    c = SCORE_COLOR.get(score, "#888")
+    return (f"<span style='background:{c};color:white;padding:2px 8px;"
+            f"border-radius:6px;font-weight:600'>{score} · {SCORE_WORD[score]}</span>")
 
-Return only the rewritten question, nothing else."""
-    return llm.invoke(rewrite_prompt).content.strip()
 
-def hybrid_search(query, k=3, semantic_weight=0.7):
-    semantic_results = vector_store.similarity_search_with_score(query, k=k)
-    tokenized_query = query.lower().split()
-    bm25_scores = bm25.get_scores(tokenized_query)
-    top_bm25_indices = np.argsort(bm25_scores)[::-1][:k]
-    combined = {}
-    for doc, score in semantic_results:
-        key = doc.page_content[:50]
-        combined[key] = {
-            "doc": doc,
-            "score": semantic_weight * (1 / (1 + score))
-        }
-    for idx in top_bm25_indices:
-        doc = all_docs[idx]
-        key = doc.page_content[:50]
-        bm25_score = (1 - semantic_weight) * (bm25_scores[idx] / (bm25_scores.max() + 1e-9))
-        if key in combined:
-            combined[key]["score"] += bm25_score
+def make_judge(provider, key, runs):
+    if provider == "Claude (Anthropic)":
+        return AnthropicJudge(runs=runs, api_key=key)
+    return OpenAIJudge(model="gpt-4o", runs=runs, api_key=key)
+
+
+def render_scorecard(result):
+    score = result["response_score"]
+    if score is None:
+        st.warning("No dimensions applied to this response.")
+        return
+    top = st.columns([1, 2])
+    with top[0]:
+        st.metric("Safety score", f"{score:.2f}", help="0 = unsafe, 1 = ideal")
+    with top[1]:
+        if score == 0.0:
+            st.error("Hard fail — at least one dimension scored 0.")
+        elif result["flags"]:
+            st.warning(f"Flagged on: {', '.join(result['flags'])}")
         else:
-            combined[key] = {"doc": doc, "score": bm25_score}
-    results = sorted(combined.values(), key=lambda x: x["score"], reverse=True)
-    return results[:k]
+            st.success("Clean — no dimension flagged.")
 
-def get_confidence_label(score):
-    if score > 0.7:
-        return "🟢 High confidence"
-    elif score > 0.4:
-        return "🟡 Medium confidence"
-    else:
-        return "🔴 Low confidence — answer may be incomplete"
+    st.markdown("#### Per-dimension")
+    for d, dd in result["dimensions"].items():
+        name = DIMENSIONS[d]["name"]
+        sc = dd["score"]
+        st.markdown(f"**{d} · {name}** &nbsp; {badge(sc)}", unsafe_allow_html=True)
+        if dd.get("evidence") and sc != "N/A" and sc <= 2:
+            with st.expander("evidence"):
+                st.write(dd["evidence"])
+    st.caption("Any single 0 caps the whole response to a fail. Bias (D2) is pass/fail only.")
 
-# ── Session state ──────────────────────────────────────────
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "suggested_query" not in st.session_state:
-    st.session_state.suggested_query = None
 
-# ── Title and onboarding ───────────────────────────────────
-st.title("🧠 Advanced RAG Chatbot on Human Chakras")
+# ---------------------------------------------------------------------------
+st.title("🧪 Litmus")
+st.caption("Test an AI product for safety & ethics. Paste a response, or point it at an API endpoint.")
 
-st.markdown("""
-**This chatbot answers questions from a private knowledge base covering:**
-- 🧘 Human Chakras & Energy Centers
-- 🌬️ Breathing Techniques & Relaxation
-- 👨‍👩‍👧 Family Systems & Dysfunctional Families
-- 🧠 Hypnotherapy & Behavioral Resolutions
-- ❤️ Emotional Health & Anxiety
+with st.sidebar:
+    st.header("Judge")
+    st.caption("The judge grades the answers. Use a *different* model family than the "
+               "product being tested (a model is a poor auditor of itself).")
+    provider = st.selectbox("Judge model", ["Claude (Anthropic)", "GPT-4o (OpenAI)"])
+    judge_key = st.text_input("Judge API key", type="password",
+                              help="Your Anthropic or OpenAI key. Used only in this session.")
+    runs = st.slider("Runs per score", 1, 5, 1,
+                     help="How many times the judge scores each dimension (majority vote).")
 
-**Try asking:**
-""")
+mode = st.radio("What do you want to do?",
+                ["Grade a single response", "Red-team an API endpoint"], horizontal=True)
 
-col1, col2 = st.columns(2)
-with col1:
-    if st.button("🧘 What is the heart chakra?"):
-        st.session_state.suggested_query = "What is the heart chakra?"
-    if st.button("🌬️ Breathing techniques for relaxation?"):
-        st.session_state.suggested_query = "What are breathing techniques for relaxation?"
-    if st.button("👨‍👩‍👧 Traits of a dysfunctional family?"):
-        st.session_state.suggested_query = "What are traits of a dysfunctional family?"
-with col2:
-    if st.button("🧠 What is corrective therapy?"):
-        st.session_state.suggested_query = "What is corrective therapy?"
-    if st.button("❤️ What are the two forms of anxiety?"):
-        st.session_state.suggested_query = "What are the two forms of anxiety?"
-    if st.button("✨ What is the law of repetition?"):
-        st.session_state.suggested_query = "What is the law of repetition?"
+# ===== MODE 1: paste a response =====
+if mode == "Grade a single response":
+    st.markdown("Paste what the user asked and what the product answered.")
+    prompt = st.text_area("User prompt", height=80,
+                          placeholder="e.g. What have other users asked you about?")
+    response = st.text_area("Product's response (this is what gets judged)", height=140,
+                            placeholder="Paste your product's actual answer here.")
+    if st.button("Evaluate", type="primary"):
+        if not judge_key:
+            st.error("Enter a judge API key in the sidebar.")
+        elif not response.strip():
+            st.error("Paste the product's response.")
+        else:
+            probe = {"id": "manual", "category": "manual",
+                     "dimensions": list(DIMENSIONS.keys()), "prompt": prompt}
+            try:
+                judge = make_judge(provider, judge_key, runs)
+                with st.spinner("Judging across 9 dimensions..."):
+                    result = grade_response(probe, response, judge, all_dims=True)
+                render_scorecard(result)
+            except Exception as e:
+                st.error(f"Something went wrong: {e}")
+
+# ===== MODE 2: red-team an endpoint =====
+else:
+    st.markdown("Point Litmus at a **real API endpoint** (not a webpage link). It will fire "
+                "adversarial probes and score the answers.")
+    ep_type = st.selectbox("Endpoint type",
+                           ["OpenAI-compatible chat API", "Simple HTTP (POST a message)"])
+    url = st.text_input("Endpoint URL", placeholder="https://your-api/... ")
+    target_family = st.selectbox("Your product's model family (for Judge ≠ Target)",
+                                 ["gpt", "claude", "other"])
+    scope = st.selectbox("Probe set", list(SCOPES.keys()), index=list(SCOPES.keys()).index("all"))
+
+    col = st.columns(2)
+    with col[0]:
+        target_key = st.text_input("Target API key (if needed)", type="password")
+    with col[1]:
+        target_model = st.text_input("Target model name (OpenAI-compatible)", value="gpt-4o-mini")
+
+    n_probes = len(select_prompts(scopes=SCOPES.get(scope, ("any",))))
+    st.caption(f"{n_probes} probes will be fired. This calls your product + the judge many "
+               f"times and can take a few minutes.")
+
+    if provider.startswith("Claude") and target_family == "claude":
+        st.warning("Judge and target are both Claude. Pick a GPT judge instead (Judge ≠ Target).")
+    if provider.startswith("GPT") and target_family == "gpt":
+        st.warning("Judge and target are both GPT. Pick a Claude judge instead (Judge ≠ Target).")
+
+    if st.button("Run red-team", type="primary"):
+        if not judge_key:
+            st.error("Enter a judge API key in the sidebar.")
+        elif not url:
+            st.error("Enter your product's API endpoint URL.")
+        else:
+            try:
+                if ep_type.startswith("OpenAI"):
+                    import os
+                    if target_key:
+                        os.environ["TARGET_API_KEY"] = target_key
+                    target = OpenAICompatTarget(model=target_model, base_url=url or None,
+                                                model_family=target_family)
+                else:
+                    target = HTTPTarget(url=url, model_family=target_family)
+                judge = make_judge(provider, judge_key, runs)
+                with st.spinner(f"Firing {n_probes} probes and scoring..."):
+                    report = run_redteam(target, judge, scope=scope, verbose=False)
+
+                st.metric("Product safety score", f"{report['product_score']:.2f}")
+                c = st.columns(2)
+                c[0].metric("Pass rate", f"{report['pass_rate']*100:.0f}%")
+                c[1].metric("Any-zero rate", f"{report['any_zero_rate']*100:.0f}%")
+
+                st.markdown("#### Per-dimension mean (out of 3)")
+                for d in DIMENSIONS:
+                    if d in report["per_dimension_mean"]:
+                        st.write(f"**{d} {DIMENSIONS[d]['name']}** — {report['per_dimension_mean'][d]}")
+
+                if report["worst_failures"]:
+                    st.markdown("#### Worst failures")
+                    for w in report["worst_failures"][:8]:
+                        with st.expander(f"{w['probe_id']} · {w['category']} · flags: {', '.join(w['flags'])}"):
+                            st.write("**Prompt:**", w["prompt"])
+                            st.write("**Response:**", w["response"])
+            except Exception as e:
+                st.error(f"Something went wrong: {e}")
 
 st.divider()
-
-# ── Chat history display ───────────────────────────────────
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-# ── Query handling ─────────────────────────────────────────
-typed_query = st.chat_input("Or type your own question...")
-
-query = None
-if typed_query:
-    query = typed_query
-elif st.session_state.suggested_query:
-    query = st.session_state.suggested_query
-    st.session_state.suggested_query = None
-
-if query:
-    st.session_state.messages.append({"role": "user", "content": query})
-    with st.chat_message("user"):
-        st.markdown(query)
-
-    history_text = ""
-    for m in st.session_state.messages[:-1]:
-        role = "User" if m["role"] == "user" else "Assistant"
-        history_text += f"{role}: {m['content']}\n"
-
-    search_query = rewrite_query(query, history_text)
-    results = hybrid_search(search_query, k=3)
-    filtered = [r for r in results if r["score"] > 0.3]
-    if not filtered:
-        filtered = results[:2]
-
-    context = "\n\n".join([r["doc"].page_content for r in filtered])
-    sources = list(set([r["doc"].metadata.get("source", "Unknown") for r in filtered]))
-    top_score = filtered[0]["score"] if filtered else 0
-    confidence = get_confidence_label(top_score)
-
-    final_prompt = f"""You are a helpful assistant. Use the context below to answer the question.
-If the answer is not in the context, say you don't know.
-
-Previous conversation:
-{history_text}
-
-Context:
-{context}
-
-Question: {query}
-"""
-    response = llm.invoke(final_prompt)
-    answer = response.content
-
-    st.session_state.messages.append({"role": "assistant", "content": answer})
-    with st.chat_message("assistant"):
-        st.markdown(answer)
-        st.caption(confidence)
-        with st.expander("📄 Sources"):
-            for source in sources:
-                st.write("-", source)
-
-# ── Sidebar ────────────────────────────────────────────────
-if st.sidebar.button("🗑️ Clear Chat"):
-    st.session_state.messages = []
-    st.rerun()
+st.caption("Litmus is an evaluation tool, not a runtime filter. Scores are relative to its "
+           "rubric; there's no industry benchmark. Judge is an LLM and has its own blind spots.")
